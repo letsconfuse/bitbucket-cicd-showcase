@@ -218,6 +218,5 @@ Set-ExecutionPolicy RemoteSigned -Scope LocalMachine
 
 - Use **Bitbucket Secured Variables** for all credentials — they are masked in pipeline logs
 - Consider replacing password auth with **SSH key pairs** for production
-- Restrict EC2 Security Group port 22 to **Bitbucket's IP ranges** only:
-  https://support.atlassian.com/bitbucket-cloud/docs/what-are-the-bitbucket-cloud-ip-addresses/
+- Restrict EC2 Security Group port 22 to **Bitbucket's IP ranges** only
 - The deploy scripts are deleted from `C:\temp\` after each run
