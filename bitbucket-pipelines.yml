@@ -1,0 +1,240 @@
+# =============================================================================
+# Bitbucket CI/CD Pipeline
+# Angular UI + .NET 6 API → IIS on AWS EC2 (Windows)
+# Deploy method: MSDeploy (Web Deploy) via SSH
+#
+# Required Bitbucket Repository Variables:
+#   REMOTE_USERNAME       - Windows server login username
+#   REMOTE_PASSWORD       - Windows server login password (mark as Secured)
+#   REMOTE_SERVER_IP      - EC2 public or private IP address
+#   IIS_UI_PHYSICAL_PATH  - Physical path of Angular site  e.g. C:\inetpub\wwwroot\suite-edge\wwwroot
+#   IIS_API_PHYSICAL_PATH - Physical path of .NET API      e.g. C:\inetpub\wwwroot\suite-edge\api
+#   IIS_APP_POOL_NAME     - IIS app pool name              e.g. suite-edge-pipeline
+#   IIS_SITE_NAME         - IIS site name                  e.g. suite-edge
+# =============================================================================
+
+# ── UI Pipeline ───────────────────────────────────────────────────────────────
+# Uses Node 18 image for Angular builds
+image: node:18-bullseye
+
+pipelines:
+  branches:
+    cicd-pipeline:
+
+      # ── Step 1: Build Angular UI ────────────────────────────────────────────
+      - step:
+          name: Build Edge UI
+          size: 2x
+          caches:
+            - node
+          script:
+            - set -e
+            - apt-get update -qq
+            - apt-get install -y zip
+
+            # Install dependencies
+            - npm install --legacy-peer-deps
+
+            # Build Angular app for production
+            - npm run build -- --configuration production --output-path=./edge_publish_ui --base-href=/ --verbose=false
+
+            # Package build output
+            - cd edge_publish_ui
+            - zip -r ../edge_publish_ui.zip .
+            - cd ..
+          artifacts:
+            - edge_publish_ui.zip
+
+      # ── Step 2: Deploy Angular UI ───────────────────────────────────────────
+      # Near-zero downtime: MSDeploy writes files live, no app pool stop needed.
+      # Files protected from overwrite:
+      #   - web.config
+      #   - assets/configuration/appsetting.json
+      - step:
+          name: Deploy Edge UI via MSDeploy
+          deployment: production
+          script:
+            - set -e
+            - apt-get update -qq
+            - apt-get install -y openssh-client sshpass
+
+            # Upload build zip to server temp folder
+            - sshpass -p "$REMOTE_PASSWORD" scp -o StrictHostKeyChecking=no
+              edge_publish_ui.zip
+              $REMOTE_USERNAME@$REMOTE_SERVER_IP:C:/temp/edge_publish_ui.zip
+
+            # Generate PowerShell deploy script with variables injected via sed
+            # (Bitbucket env vars are not available in remote SSH sessions,
+            #  so we bake the values in before uploading the script)
+            - |
+              cat > deploy_ui.ps1 << 'EOF'
+              $ErrorActionPreference = 'Stop'
+              $msdeploy = 'C:\Program Files\IIS\Microsoft Web Deploy V3\msdeploy.exe'
+              $source   = 'C:\temp\edge_publish_ui'
+              $dest     = 'IIS_UI_PHYSICAL_PATH_PLACEHOLDER'
+
+              Write-Host ">>> Cleaning old extract..."
+              if (Test-Path $source) { Remove-Item $source -Recurse -Force }
+
+              Write-Host ">>> Extracting zip..."
+              Expand-Archive -Path 'C:\temp\edge_publish_ui.zip' -DestinationPath $source -Force
+
+              Write-Host ">>> Files extracted:"
+              Get-ChildItem $source | Select-Object Name
+
+              Write-Host ">>> Running MSDeploy sync..."
+              & $msdeploy `
+                -verb:sync `
+                -source:contentPath=$source `
+                -dest:contentPath=$dest `
+                -skip:objectName=filePath,absolutePath='.*web\.config$' `
+                -skip:objectName=filePath,absolutePath='.*appsetting\.json$' `
+                -useCheckSum `
+                -enableRule:DoNotDeleteRule `
+                -verbose
+
+              Write-Host ">>> Cleaning up temp files..."
+              Remove-Item 'C:\temp\edge_publish_ui.zip' -Force -ErrorAction SilentlyContinue
+              Remove-Item $source -Recurse -Force -ErrorAction SilentlyContinue
+              Remove-Item 'C:\temp\deploy_ui.ps1' -Force -ErrorAction SilentlyContinue
+
+              Write-Host ">>> UI Deployment complete!"
+              EOF
+
+            # Inject Bitbucket variable values into the script
+            - sed -i "s|IIS_UI_PHYSICAL_PATH_PLACEHOLDER|$IIS_UI_PHYSICAL_PATH|g" deploy_ui.ps1
+
+            # Upload deploy script to server
+            - sshpass -p "$REMOTE_PASSWORD" scp -o StrictHostKeyChecking=no
+              deploy_ui.ps1
+              $REMOTE_USERNAME@$REMOTE_SERVER_IP:C:/temp/deploy_ui.ps1
+
+            # Execute deploy script on server
+            - sshpass -p "$REMOTE_PASSWORD" ssh -o StrictHostKeyChecking=no
+              $REMOTE_USERNAME@$REMOTE_SERVER_IP
+              "powershell -ExecutionPolicy Bypass -File C:\temp\deploy_ui.ps1"
+
+# =============================================================================
+# API Pipeline
+# Uses .NET SDK 6.0 image for API builds
+# NOTE: Trigger is manual — API deploys require deliberate confirmation
+#       because they cause a brief (~10-30s) app pool downtime
+# =============================================================================
+  custom:
+    deploy-edge-api:
+      - step:
+          name: Build Edge API
+          image: mcr.microsoft.com/dotnet/sdk:6.0
+          caches:
+            - dotnetcore
+          script:
+            - set -e
+
+            # Restore and publish .NET project
+            - dotnet restore ZENTIXS_EDGE_API/ZENTIXS_EDGE_API.csproj
+            - dotnet publish ZENTIXS_EDGE_API/ZENTIXS_EDGE_API.csproj -c Release -o edge_publish_api
+
+            # Install zip
+            - apt-get update -qq && apt-get install -y zip
+
+            # Remove environment-specific config files from artifact
+            # These are protected on the server and must not be overwritten
+            - rm -f edge_publish_api/appsettings.json
+            - rm -f edge_publish_api/appsettings.Development.json
+            - rm -f edge_publish_api/web.config
+
+            # Package build output
+            - cd edge_publish_api
+            - zip -r ../edge_publish_api.zip .
+            - cd ..
+          artifacts:
+            - edge_publish_api.zip
+
+      # ── Step 2: Deploy .NET API ─────────────────────────────────────────────
+      # Brief downtime (~10-30s): app pool is stopped to release .dll file locks,
+      # MSDeploy syncs files, then app pool is restarted.
+      # Files protected from overwrite:
+      #   - web.config
+      #   - appsettings.json
+      #   - appsettings.*.json
+      - step:
+          name: Deploy Edge API via MSDeploy
+          trigger: manual
+          deployment: production
+          image: mcr.microsoft.com/dotnet/sdk:6.0
+          script:
+            - set -e
+            - apt-get update -qq
+            - apt-get install -y openssh-client sshpass
+
+            # Upload build zip to server temp folder
+            - sshpass -p "$REMOTE_PASSWORD" scp -o StrictHostKeyChecking=no
+              edge_publish_api.zip
+              $REMOTE_USERNAME@$REMOTE_SERVER_IP:C:/temp/edge_publish_api.zip
+
+            # Generate PowerShell deploy script with variables injected via sed
+            - |
+              cat > deploy_api.ps1 << 'EOF'
+              $ErrorActionPreference = 'Stop'
+              $msdeploy  = 'C:\Program Files\IIS\Microsoft Web Deploy V3\msdeploy.exe'
+              $source    = 'C:\temp\edge_publish_api'
+              $dest      = 'IIS_API_PHYSICAL_PATH_PLACEHOLDER'
+              $appPool   = 'IIS_APP_POOL_NAME_PLACEHOLDER'
+
+              Write-Host ">>> Cleaning old extract..."
+              if (Test-Path $source) { Remove-Item $source -Recurse -Force }
+
+              Write-Host ">>> Extracting zip..."
+              Expand-Archive -Path 'C:\temp\edge_publish_api.zip' -DestinationPath $source -Force
+
+              Write-Host ">>> Files extracted:"
+              Get-ChildItem $source | Select-Object Name
+
+              Write-Host ">>> Stopping app pool: $appPool"
+              Import-Module WebAdministration
+              Stop-WebAppPool -Name $appPool
+              Start-Sleep -Seconds 5
+
+              Write-Host ">>> Running MSDeploy sync..."
+              & $msdeploy `
+                -verb:sync `
+                -source:contentPath=$source `
+                -dest:contentPath=$dest `
+                -skip:objectName=filePath,absolutePath='.*appsettings.*\.json$' `
+                -skip:objectName=filePath,absolutePath='.*web\.config$' `
+                -useCheckSum `
+                -enableRule:DoNotDeleteRule `
+                -verbose
+
+              Write-Host ">>> Starting app pool: $appPool"
+              Start-WebAppPool -Name $appPool
+              Start-Sleep -Seconds 3
+
+              Write-Host ">>> Verifying app pool state..."
+              $state = (Get-WebAppPoolState -Name $appPool).Value
+              Write-Host ">>> App pool state: $state"
+              if ($state -ne 'Started') {
+                throw "App pool failed to start. State: $state"
+              }
+
+              Write-Host ">>> Cleaning up temp files..."
+              Remove-Item 'C:\temp\edge_publish_api.zip' -Force -ErrorAction SilentlyContinue
+              Remove-Item $source -Recurse -Force -ErrorAction SilentlyContinue
+              Remove-Item 'C:\temp\deploy_api.ps1' -Force -ErrorAction SilentlyContinue
+
+              Write-Host ">>> API Deployment complete!"
+              EOF
+
+            # Inject Bitbucket variable values into the script
+            - sed -i "s|IIS_API_PHYSICAL_PATH_PLACEHOLDER|$IIS_API_PHYSICAL_PATH|g" deploy_api.ps1
+            - sed -i "s|IIS_APP_POOL_NAME_PLACEHOLDER|$IIS_APP_POOL_NAME|g" deploy_api.ps1
+
+            # Upload deploy script to server
+            - sshpass -p "$REMOTE_PASSWORD" scp -o StrictHostKeyChecking=no
+              deploy_api.ps1
+              $REMOTE_USERNAME@$REMOTE_SERVER_IP:C:/temp/deploy_api.ps1
+
+            # Execute deploy script on server
+            - sshpass -p "$REMOTE_PASSWORD" ssh -o StrictHostKeyChecking=no
+              $REMOTE_USERNAME@$REMOTE_SERVER_IP
+              "powershell -ExecutionPolicy Bypass -File C:\temp\deploy_api.ps1"
