@@ -37,7 +37,7 @@ Bitbucket Pipeline
 
 1. **IIS** installed and configured with your site and app pool
 2. **Web Deploy 3.5+** installed with full features:
-   - Download: https://www.microsoft.com/en-us/download/details.aspx?id=43717
+
    - Install with **Complete** option (not default/typical)
 3. **OpenSSH Server** installed and running:
    ```powershell
@@ -221,9 +221,3 @@ Set-ExecutionPolicy RemoteSigned -Scope LocalMachine
 - Restrict EC2 Security Group port 22 to **Bitbucket's IP ranges** only:
   https://support.atlassian.com/bitbucket-cloud/docs/what-are-the-bitbucket-cloud-ip-addresses/
 - The deploy scripts are deleted from `C:\temp\` after each run
-
----
-
-## License
-
-MIT
