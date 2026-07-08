@@ -1,222 +1,116 @@
-# Bitbucket CI/CD Pipeline — Angular UI + .NET API → IIS on AWS EC2
+# 🚀 Enterprise Bitbucket CI/CD — Angular + .NET on IIS
 
-A production-ready CI/CD pipeline for deploying an **Angular frontend** and **.NET 6 API** to **IIS on a Windows EC2 instance** using **MSDeploy (Web Deploy)** via Bitbucket Pipelines.
+![Bitbucket Pipelines](https://img.shields.io/badge/Bitbucket-Pipelines-blue?logo=bitbucket)
+![Angular](https://img.shields.io/badge/Angular-Production-red?logo=angular)
+![.NET 8](https://img.shields.io/badge/.NET_8-API-512BD4?logo=dotnet)
+![Security](https://img.shields.io/badge/DevSecOps-Snyk%20%7C%20Gitleaks-success)
 
----
-
-## Architecture Overview
-
-```
-Bitbucket Pipeline
-│
-├── Build Step (Linux runner)
-│   ├── Angular → npm build → edge_publish_ui.zip
-│   └── .NET 6  → dotnet publish → edge_publish_api.zip
-│
-├── SCP → Upload zip to EC2 Windows Server (C:\temp\)
-├── SCP → Upload deploy.ps1 script to EC2
-│
-└── SSH → Execute deploy.ps1 on server
-        └── MSDeploy sync → IIS wwwroot
-```
+A production-grade, DevSecOps-integrated CI/CD pipeline for deploying an **Angular frontend** and **.NET 8 API** to **IIS on a Windows EC2 instance**. This repository demonstrates Senior DevOps engineering patterns, including zero-downtime deployments, automated rollbacks, and rigorous security gates.
 
 ---
 
-## Downtime Characteristics
+## 🌟 Enterprise Features Implemented
 
-| Component | Downtime | Reason |
-|---|---|---|
-| Angular UI | ~0 seconds | MSDeploy writes files live; content-hashed filenames prevent stale cache |
-| .NET API | ~10–30 seconds | App pool must stop to release `.dll` file locks before sync |
+*   **DevSecOps Pipeline:** Integrated `gitleaks` (secret scanning) and `Snyk` (dependency vulnerability scanning).
+*   **Zero-Downtime UI Deployments:** MSDeploy differential sync with content hashing ensures users never experience broken assets during deployments.
+*   **Automated Smoke Testing:** Post-deployment HTTP health checks with automated retries and timeouts.
+*   **Instant Rollback Mechanism:** Pipeline automatically archives the `N-1` state. Included custom pipelines (`rollback-ui`, `rollback-api`) to restore the previous release in seconds.
+*   **Environment Promotion:** Multi-stage promotion (`develop` -> Staging -> `main` -> Production) with manual approval gates for production.
+*   **Secure Authentication:** Uses Native SSH Key Authentication (no password-based SSH).
+*   **Rich Observability:** Automated Slack notifications for deployment success, failure, and rollback events.
+*   **DRY YAML Architecture:** Heavily utilizes YAML anchors (`&` and `*`) to maintain a clean, reusable pipeline definition.
 
 ---
 
-## Prerequisites
+## 🏗️ Architecture Overview
 
-### On the EC2 Windows Server
-
-1. **IIS** installed and configured with your site and app pool
-2. **Web Deploy 3.5+** installed with full features:
-
-   - Install with **Complete** option (not default/typical)
-3. **OpenSSH Server** installed and running:
-   ```powershell
-   Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
-   Start-Service sshd
-   Set-Service -Name sshd -StartupType Automatic
-   ```
-4. **Port 22** open in EC2 Security Group for SSH/SCP
-5. **`C:\temp`** directory exists on the server:
-   ```powershell
-   New-Item -ItemType Directory -Path "C:\temp" -Force
-   ```
-
-### Verify Web Deploy is working
-
-```powershell
-# Check MsDepSvc is running
-Get-Service -Name MsDepSvc
-
-# Verify MSDeploy can read your site path
-& "C:\Program Files\IIS\Microsoft Web Deploy V3\msdeploy.exe" `
-  -verb:dump `
-  -source:contentPath="C:\inetpub\wwwroot\your-site\wwwroot" `
-  -verbose
+```mermaid
+graph TD;
+    A[Push to 'main'] --> B(Quality Gates);
+    B --> C{Security Scans};
+    C -->|Gitleaks & Snyk| D(Build Angular & .NET);
+    D --> E[Deploy to Staging];
+    E --> F(Automated Smoke Test);
+    F --> G{Manual Approval};
+    G -->|Approve UI| H[Archive N-1 UI & MSDeploy];
+    G -->|Approve API| I[Archive N-1 API & MSDeploy];
+    H --> J(Prod UI Smoke Test);
+    I --> K(Prod API Smoke Test);
+    J --> L((Slack Alert));
+    K --> L;
 ```
 
 ---
 
-## Bitbucket Repository Variables
+## 🛠️ Prerequisites & Setup
 
-Go to **Repository Settings → Repository Variables** and add:
+### 1. On the EC2 Windows Server
+1. **IIS** installed and configured.
+2. **Web Deploy 3.5+** installed with the **Complete** option.
+3. **OpenSSH Server** installed and running.
+4. **`C:\temp` and `C:\releases`** directories created.
+5. **SSH Key Setup:** Add the Bitbucket pipeline's public SSH key to the server's `C:\Users\<user>\.ssh\authorized_keys`.
 
-| Variable | Example Value | Description |
-|---|---|---|
-| `REMOTE_USERNAME` | `administrator` | Windows login username |
-| `REMOTE_PASSWORD` | `your-password` | Windows login password (mark as secured) |
-| `REMOTE_SERVER_IP` | `13.233.x.x` | EC2 public or private IP |
-| `IIS_UI_PHYSICAL_PATH` | `C:\inetpub\wwwroot\suite-edge\wwwroot` | Physical path of Angular site in IIS |
-| `IIS_API_PHYSICAL_PATH` | `C:\inetpub\wwwroot\suite-edge\api` | Physical path of .NET API in IIS |
-| `IIS_APP_POOL_NAME` | `suite-edge-pipeline` | IIS app pool name for the API |
-| `IIS_SITE_NAME` | `suite-edge` | IIS site name |
+### 2. Bitbucket Repository Settings
+Configure the following in **Repository settings > Repository variables**:
 
-> **Tip:** Mark `REMOTE_PASSWORD` as **Secured** in Bitbucket so it is masked in logs.
+| Variable | Description | Security |
+| :--- | :--- | :--- |
+| `PROD_REMOTE_USERNAME` | Windows server SSH username | Standard |
+| `PROD_REMOTE_SERVER_IP` | EC2 IP Address | Standard |
+| `PROD_IIS_UI_PHYSICAL_PATH` | e.g. `C:\inetpub\wwwroot\ui` | Standard |
+| `PROD_IIS_API_PHYSICAL_PATH`| e.g. `C:\inetpub\wwwroot\api` | Standard |
+| `PROD_IIS_APP_POOL_NAME` | IIS App Pool name for the API | Standard |
+| `PROD_HEALTH_CHECK_URL` | API health endpoint for smoke tests | Standard |
+| `SLACK_WEBHOOK_URL` | Webhook for deployment alerts | **Secured** |
+| `SNYK_TOKEN` | Snyk API token for dependency scanning | **Secured** |
 
----
-
-## Pipeline Structure
-
-```
-bitbucket-pipelines.yml         # Main pipeline definition
-scripts/
-  deploy_ui.ps1                 # PowerShell deploy script for Angular UI
-  deploy_api.ps1                # PowerShell deploy script for .NET API
-```
-
-The pipeline:
-1. **Generates** the PowerShell deploy scripts locally on the Linux runner
-2. **Injects** Bitbucket variables into the scripts using `sed` (since `$env:` variables don't cross SSH sessions)
-3. **Uploads** both the zip artifact and the `.ps1` script to the server via SCP
-4. **Executes** the script remotely via SSH
+*(Note: Duplicate the `PROD_` variables with a `STG_` prefix for the staging environment).*
 
 ---
 
-## Files Protected from Overwrite
+## 🛡️ Files Protected During Sync
 
-The following files on the server are **never overwritten** by MSDeploy, even if they exist in the build artifact:
+The pipeline utilizes MSDeploy's `-skip` rules to ensure server-specific configurations are never overwritten by the build artifact:
 
-| File | Reason |
-|---|---|
-| `web.config` | Contains server-specific IIS rewrite rules |
-| `appsettings.json` | Contains environment-specific API configuration |
-| `appsettings.*.json` | Environment-specific config overrides |
-| `assets/configuration/appsetting.json` | Angular runtime configuration |
+*   `web.config` (IIS URL Rewrite rules)
+*   `appsettings.json` and `appsettings.*.json` (.NET environment variables)
+*   `assets/configuration/appsetting.json` (Angular runtime configurations)
 
 ---
 
-## How MSDeploy Differential Sync Works
+## ⏪ Rollback Strategy
 
-Unlike a simple file copy, MSDeploy uses **checksum-based diffing**:
+Mistakes happen. This pipeline is built for high availability. 
 
-```
-Build artifact (source)
-        │
-        ▼
-MSDeploy compares checksums
-        │
-        ├── File unchanged → skip (no write)
-        ├── File changed   → overwrite
-        └── File new       → add
-```
+Before every deployment, the server executes a PowerShell command to back up the current physical path to `C:\releases\ui\<timestamp>`. 
 
-This means:
-- Only **changed files** are written to disk
-- The IIS site keeps **serving existing files** during the sync
-- Angular's **content-hashed filenames** (`main.a1b2c3.js`) mean there is no moment where a browser gets a mismatched `index.html` and `.js` bundle
+If a production smoke test fails, you can instantly recover:
+1. Go to Bitbucket Pipelines.
+2. Select **Run Pipeline** -> **Custom** -> `rollback-ui-production` (or API).
+3. The server instantly drops the broken deployment and restores the `N-1` backup.
 
 ---
 
-## Deployment Flow
+## 📁 Repository Structure
 
-### UI Deploy (automatic on push)
-```
-push to cicd-pipeline branch
-    → npm install
-    → ng build --configuration production
-    → zip artifact
-    → scp zip to C:\temp\
-    → scp deploy_ui.ps1 to C:\temp\
-    → ssh: powershell -File deploy_ui.ps1
-        → Expand-Archive
-        → msdeploy -verb:sync (skip web.config, appsetting.json)
-        → cleanup temp files
-```
-
-### API Deploy (manual trigger)
-```
-manual trigger in Bitbucket
-    → dotnet restore
-    → dotnet publish -c Release
-    → remove appsettings + web.config from artifact
-    → zip artifact
-    → scp zip to C:\temp\
-    → scp deploy_api.ps1 to C:\temp\
-    → ssh: powershell -File deploy_api.ps1
-        → Expand-Archive
-        → Stop-WebAppPool
-        → msdeploy -verb:sync (skip appsettings*.json, web.config)
-        → Start-WebAppPool
-        → verify app pool state
-        → cleanup temp files
+```text
+├── bitbucket-pipelines.yml   # Main CI/CD definition
+├── CHANGELOG.md              # Semantic versioning history
+├── SECURITY.md               # DevSecOps disclosure policies
+├── docs/
+│   └── runbook.md            # Operational deployment guides
+├── scripts/
+│   ├── deploy_ui.ps1         # MSDeploy script for Angular
+│   ├── deploy_api.ps1        # MSDeploy script for .NET (App Pool management)
+│   ├── rollback_ui.ps1       # N-1 UI restore script
+│   └── rollback_api.ps1      # N-1 API restore script
+└── tests/
+    └── smoke-test.sh         # Resilient HTTP health checker
 ```
 
 ---
 
-## Troubleshooting
-
-**SCP upload fails / zip not found on server**
-```powershell
-# Make sure C:\temp exists
-New-Item -ItemType Directory -Path "C:\temp" -Force
-
-# Check OpenSSH is running
-Get-Service sshd
-```
-
-**MSDeploy skips not working**
-```powershell
-# Test skip rules manually on server
-& "C:\Program Files\IIS\Microsoft Web Deploy V3\msdeploy.exe" `
-  -verb:sync `
-  -source:contentPath="C:\temp\edge_publish_ui" `
-  -dest:contentPath="C:\inetpub\wwwroot\your-site" `
-  -skip:objectName=filePath,absolutePath='.*web\.config$' `
-  -skip:objectName=filePath,absolutePath='.*appsetting\.json$' `
-  -whatif `
-  -verbose
-```
-> `-whatif` does a dry run — shows what would change without writing anything.
-
-**App pool name is null / not found**
-```powershell
-# List all app pools and their physical paths
-Get-WebApplication | Select-Object Path, ApplicationPool, PhysicalPath
-
-# Check app pool state
-Get-WebAppPoolState -Name "your-app-pool-name"
-```
-
-**PowerShell ExecutionPolicy blocking script**
-```powershell
-# On the server, allow remote signed scripts
-Set-ExecutionPolicy RemoteSigned -Scope LocalMachine
-```
-
----
-
-## Security Notes
-
-- Use **Bitbucket Secured Variables** for all credentials — they are masked in pipeline logs
-- Consider replacing password auth with **SSH key pairs** for production
-- Restrict EC2 Security Group port 22 to **Bitbucket's IP ranges** only
-- The deploy scripts are deleted from `C:\temp\` after each run
+## 📚 Further Reading
+*   Review [docs/runbook.md](docs/runbook.md) for incident response protocols.
+*   Review [SECURITY.md](SECURITY.md) for our vulnerability handling process.
