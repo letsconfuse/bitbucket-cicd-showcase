@@ -217,7 +217,7 @@ pipelines:
 
             # Inject Bitbucket variables into deploy script, upload, execute
             - sed "s|IIS_UI_PHYSICAL_PATH_PLACEHOLDER|$STG_IIS_UI_PHYSICAL_PATH|g"
-                scripts/deploy_ui.ps1 > deploy_ui_staging.ps1
+                scripts/windows/deploy_ui.ps1 > deploy_ui_staging.ps1
 
             - scp -o BatchMode=yes deploy_ui_staging.ps1
                 $STG_REMOTE_USERNAME@$STG_REMOTE_SERVER_IP:C:/temp/deploy_ui.ps1
@@ -244,7 +244,7 @@ pipelines:
 
             - sed -e "s|IIS_API_PHYSICAL_PATH_PLACEHOLDER|$STG_IIS_API_PHYSICAL_PATH|g" \
                   -e "s|IIS_APP_POOL_NAME_PLACEHOLDER|$STG_IIS_APP_POOL_NAME|g" \
-                  scripts/deploy_api.ps1 > deploy_api_staging.ps1
+                  scripts/windows/deploy_api.ps1 > deploy_api_staging.ps1
 
             - scp -o BatchMode=yes deploy_api_staging.ps1
                 $STG_REMOTE_USERNAME@$STG_REMOTE_SERVER_IP:C:/temp/deploy_api.ps1
@@ -291,7 +291,7 @@ pipelines:
                 $STG_REMOTE_USERNAME@$STG_REMOTE_SERVER_IP:C:/temp/edge_publish_ui.zip
 
             - sed "s|IIS_UI_PHYSICAL_PATH_PLACEHOLDER|$STG_IIS_UI_PHYSICAL_PATH|g"
-                scripts/deploy_ui.ps1 > deploy_ui_staging.ps1
+                scripts/windows/deploy_ui.ps1 > deploy_ui_staging.ps1
 
             - scp -o BatchMode=yes deploy_ui_staging.ps1
                 $STG_REMOTE_USERNAME@$STG_REMOTE_SERVER_IP:C:/temp/deploy_ui.ps1
@@ -337,7 +337,7 @@ pipelines:
                 $PROD_REMOTE_USERNAME@$PROD_REMOTE_SERVER_IP:C:/temp/edge_publish_ui.zip
 
             - sed "s|IIS_UI_PHYSICAL_PATH_PLACEHOLDER|$PROD_IIS_UI_PHYSICAL_PATH|g"
-                scripts/deploy_ui.ps1 > deploy_ui_prod.ps1
+                scripts/windows/deploy_ui.ps1 > deploy_ui_prod.ps1
 
             - scp -o BatchMode=yes deploy_ui_prod.ps1
                 $PROD_REMOTE_USERNAME@$PROD_REMOTE_SERVER_IP:C:/temp/deploy_ui.ps1
@@ -410,7 +410,7 @@ pipelines:
 
             - sed -e "s|IIS_API_PHYSICAL_PATH_PLACEHOLDER|$PROD_IIS_API_PHYSICAL_PATH|g" \
                   -e "s|IIS_APP_POOL_NAME_PLACEHOLDER|$PROD_IIS_APP_POOL_NAME|g" \
-                  scripts/deploy_api.ps1 > deploy_api_prod.ps1
+                  scripts/windows/deploy_api.ps1 > deploy_api_prod.ps1
 
             - scp -o BatchMode=yes deploy_api_prod.ps1
                 $PROD_REMOTE_USERNAME@$PROD_REMOTE_SERVER_IP:C:/temp/deploy_api.ps1
@@ -464,6 +464,8 @@ pipelines:
             - *setup-ssh
             - apt-get update -qq && apt-get install -y openssh-client --no-install-recommends
 
+            - scp -o BatchMode=yes scripts/windows/rollback_ui.ps1 $PROD_REMOTE_USERNAME@$PROD_REMOTE_SERVER_IP:C:/temp/rollback_ui.ps1
+
             - ssh -o BatchMode=yes $PROD_REMOTE_USERNAME@$PROD_REMOTE_SERVER_IP
                 "powershell -ExecutionPolicy Bypass -File C:\\temp\\rollback_ui.ps1
                  -IisUiPath '$PROD_IIS_UI_PHYSICAL_PATH'"
@@ -491,6 +493,8 @@ pipelines:
             - set -euo pipefail
             - *setup-ssh
             - apt-get update -qq && apt-get install -y openssh-client --no-install-recommends
+
+            - scp -o BatchMode=yes scripts/windows/rollback_api.ps1 $PROD_REMOTE_USERNAME@$PROD_REMOTE_SERVER_IP:C:/temp/rollback_api.ps1
 
             - ssh -o BatchMode=yes $PROD_REMOTE_USERNAME@$PROD_REMOTE_SERVER_IP
                 "powershell -ExecutionPolicy Bypass -File C:\\temp\\rollback_api.ps1

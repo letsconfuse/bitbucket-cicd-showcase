@@ -103,15 +103,16 @@ If a production smoke test fails, you can instantly recover:
 ├── docs/
 │   └── runbook.md                  # Operational deployment guides
 ├── scripts/
-│   ├── deploy_ui.ps1               # MSDeploy script for Angular
-│   ├── deploy_api.ps1              # MSDeploy script for .NET
-│   ├── rollback_ui.ps1             # N-1 UI restore script
-│   ├── rollback_api.ps1            # N-1 API restore script
-│   └── linux/                      # Linux equivalent bash scripts
-│       ├── deploy_ui.sh            # rsync UI deployment
-│       ├── deploy_api.sh           # rsync API deployment with systemd restart
-│       ├── rollback_ui.sh          # Linux UI N-1 rollback
-│       └── rollback_api.sh         # Linux API N-1 rollback
+│   ├── windows/                    # Windows/IIS (PowerShell) scripts
+│   │   ├── deploy_ui.ps1
+│   │   ├── deploy_api.ps1
+│   │   ├── rollback_ui.ps1
+│   │   └── rollback_api.ps1
+│   └── linux/                      # Linux/Nginx (Bash) scripts
+│       ├── deploy_ui.sh
+│       ├── deploy_api.sh
+│       ├── rollback_ui.sh
+│       └── rollback_api.sh
 └── tests/
     └── smoke-test.sh               # Resilient HTTP health checker
 ```
