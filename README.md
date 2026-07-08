@@ -96,26 +96,26 @@ If a production smoke test fails, you can instantly recover:
 ## 📁 Repository Structure
 
 ```text
-├── bitbucket-pipelines.yml         # Active Main Pipeline (Windows/IIS)
-├── pipelines/                      # Alternative Pipeline Configurations
-│   ├── linux-nginx.yml             # Linux/Nginx Deployment Strategy
-│   └── database-deployment.yml     # Multi-tenant DACPAC DB Strategy
+├── bitbucket-pipelines.yml         # Symlink to windows/bitbucket-pipelines.yml
+├── windows/                        # Full Stack Windows Architecture
+│   ├── bitbucket-pipelines.yml     # CI/CD: UI + API + DB (DACPAC)
+│   └── scripts/                    # PowerShell deployment & rollback scripts
+│       ├── deploy_ui.ps1
+│       ├── deploy_api.ps1
+│       ├── rollback_ui.ps1
+│       └── rollback_api.ps1
+├── linux/                          # Full Stack Linux Architecture
+│   ├── bitbucket-pipelines.yml     # CI/CD: UI + API (Nginx & systemd)
+│   └── scripts/                    # Bash deployment & rollback scripts
+│       ├── deploy_ui.sh
+│       ├── deploy_api.sh
+│       ├── rollback_ui.sh
+│       └── rollback_api.sh
 ├── CHANGELOG.md                    # Semantic versioning history
 ├── SECURITY.md                     # DevSecOps disclosure policies
 ├── docs/
 │   ├── runbook.md                  # Operational deployment guides
 │   └── db_pipeline_audit.md        # Database deployment architecture breakdown
-├── scripts/
-│   ├── windows/                    # Windows/IIS (PowerShell) scripts
-│   │   ├── deploy_ui.ps1
-│   │   ├── deploy_api.ps1
-│   │   ├── rollback_ui.ps1
-│   │   └── rollback_api.ps1
-│   └── linux/                      # Linux/Nginx (Bash) scripts
-│       ├── deploy_ui.sh
-│       ├── deploy_api.sh
-│       ├── rollback_ui.sh
-│       └── rollback_api.sh
 └── tests/
     └── smoke-test.sh               # Resilient HTTP health checker
 ```

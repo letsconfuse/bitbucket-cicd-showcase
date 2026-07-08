@@ -1,0 +1,192 @@
+# =============================================================================
+# Full Stack CI/CD Pipeline (Windows/IIS + SQL Server)
+# Deploys: Angular UI + .NET 8 API + SQL Database DACPAC
+# =============================================================================
+
+options:
+  max-time: 60
+
+image: node:20-bullseye-slim
+
+definitions:
+  caches:
+    npm-cache: node_modules/.cache
+    nuget:     ~/.nuget/packages
+
+  script-blocks:
+    setup-ssh: &setup-ssh
+      - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+      - echo "SSH identity loaded by Bitbucket key management."
+
+    install-sql-tools: &install-sql-tools
+      - set -euo pipefail
+      - apt-get update -qq && apt-get install -y gnupg2 curl --no-install-recommends
+      - curl -sL https://packages.microsoft.com/keys/microsoft.asc | apt-key add -
+      - curl -sL https://packages.microsoft.com/config/debian/11/prod.list > /etc/apt/sources.list.d/mssql-release.list
+      - apt-get update -qq
+      - ACCEPT_EULA=Y apt-get install -y mssql-tools18 --no-install-recommends
+      - dotnet tool install --global Microsoft.SqlPackage
+      - export PATH="$PATH:$HOME/.dotnet/tools:/opt/mssql-tools18/bin"
+
+  steps:
+    - step: &build-ui
+        name: "🏗️  Build — Angular UI"
+        size: 2x
+        caches:
+          - node
+          - npm-cache
+        script:
+          - set -euo pipefail
+          - apt-get update -qq && apt-get install -y zip --no-install-recommends
+          - npm ci --prefer-offline --legacy-peer-deps
+          - npm run build -- --configuration production --output-path=./edge_publish_ui
+          - cd edge_publish_ui && zip -r ../edge_publish_ui.zip . && cd ..
+        artifacts:
+          - edge_publish_ui.zip
+
+    - step: &build-api
+        name: "🏗️  Build — .NET 8 API"
+        image: mcr.microsoft.com/dotnet/sdk:8.0
+        caches:
+          - nuget
+        script:
+          - set -euo pipefail
+          - dotnet restore ZENTIXS_EDGE_API/ZENTIXS_EDGE_API.csproj
+          - dotnet publish ZENTIXS_EDGE_API/ZENTIXS_EDGE_API.csproj -c Release -o edge_publish_api
+          - apt-get update -qq && apt-get install -y zip --no-install-recommends
+          - rm -f edge_publish_api/appsettings.json edge_publish_api/appsettings.Development.json
+          - cd edge_publish_api && zip -r ../edge_publish_api.zip . && cd ..
+        artifacts:
+          - edge_publish_api.zip
+
+    - step: &build-dacpac
+        name: "🏗️ Build — Database DACPAC"
+        image: mcr.microsoft.com/dotnet/sdk:8.0
+        caches:
+          - nuget
+        script:
+          - set -euo pipefail
+          - mkdir -p "dbo/Dependencies"
+          - curl -f -sL -u "${BITBUCKET_USERNAME}:${API_TOKEN}" "https://api.bitbucket.org/2.0/repositories/adrtaproduct/zentixs_sso_db/downloads/ZENTIXS_SSO_DB.dacpac" --output "dbo/Dependencies/ZENTIXS_SSO_DB.dacpac"
+          - SQLPROJ_PATH="$(find . -maxdepth 1 -name '*.sqlproj' | head -n 1)"
+          - dotnet restore "$SQLPROJ_PATH"
+          - dotnet build "$SQLPROJ_PATH" -c Release
+          - DACPAC_PATH="$(find bin/ -name '*.dacpac' ! -name 'ZENTIXS_SSO_DB.dacpac' | head -n 1)"
+          - cp "$DACPAC_PATH" ./release.dacpac
+        artifacts:
+          - release.dacpac
+
+    - step: &dry-run-db
+        name: "🔍 DB Dry Run (Staging)"
+        image: mcr.microsoft.com/dotnet/sdk:8.0
+        script:
+          - *install-sql-tools
+          - DB_LIST=$(sqlcmd -S "${EC2_HOST}" -U "${DB_USER}" -P "${DB_PASSWORD}" -C -Q "SET NOCOUNT ON; SELECT name FROM sys.databases WHERE name LIKE '%sso_docs%' AND state = 0;" -h -1 -W)
+          - mkdir -p ./sql_scripts
+          - |
+            for TARGET_DB in $DB_LIST; do
+              sqlpackage --action:Script --sourcefile:"./release.dacpac" \
+                --targetservername:"${EC2_HOST}" --targetdatabasename:"$TARGET_DB" \
+                --targetuser:"${DB_USER}" --targetpassword:"${DB_PASSWORD}" \
+                --outputpath:"./sql_scripts/${TARGET_DB}_migration.sql" \
+                --property:TargetTrustServerCertificate=True \
+                --property:BlockOnPossibleDataLoss=True \
+                --property:IncludeCompositeObjects=False \
+                --property:ExcludeObjectType=Logins \
+                --property:IgnoreAnsiNulls=True \
+                --property:IgnoreComments=True || true
+            done
+        artifacts:
+          - sql_scripts/**
+
+    - step: &deploy-db
+        name: "🚀 Deploy Database (Parallel)"
+        image: mcr.microsoft.com/dotnet/sdk:8.0
+        script:
+          - *install-sql-tools
+          - DB_LIST=$(sqlcmd -S "${EC2_HOST}" -U "${DB_USER}" -P "${DB_PASSWORD}" -C -Q "SET NOCOUNT ON; SELECT name FROM sys.databases WHERE name LIKE '%sso_docs%' AND state = 0;" -h -1 -W)
+          - touch /tmp/success.log /tmp/failed.log
+          - pids=""
+          - |
+            for TARGET_DB in $DB_LIST; do
+              (
+                if sqlpackage --action:Publish --sourcefile:"./release.dacpac" \
+                  --targetservername:"${EC2_HOST}" --targetdatabasename:"$TARGET_DB" \
+                  --targetuser:"${DB_USER}" --targetpassword:"${DB_PASSWORD}" \
+                  --property:TargetTrustServerCertificate=True \
+                  --property:BlockOnPossibleDataLoss=True \
+                  > "/tmp/log_${TARGET_DB}.txt" 2>&1; then
+                  echo "✅ SUCCESS: $TARGET_DB" >> /tmp/success.log
+                else
+                  echo "❌ ERROR: $TARGET_DB" >> /tmp/failed.log
+                  cat "/tmp/log_${TARGET_DB}.txt" >> /tmp/failed.log
+                fi
+              ) &
+              pids="$pids $!"
+            done
+            wait $pids
+          - if [ -s /tmp/failed.log ]; then cat /tmp/failed.log; exit 1; fi
+
+pipelines:
+  branches:
+    main:
+      - parallel:
+          - step: *build-ui
+          - step: *build-api
+          - step: *build-dacpac
+
+      # Deploy Staging
+      - step:
+          name: "🚀 Deploy UI → Staging"
+          deployment: staging
+          script:
+            - *setup-ssh
+            - apt-get update -qq && apt-get install -y openssh-client --no-install-recommends
+            - scp -o BatchMode=yes edge_publish_ui.zip $STG_REMOTE_USERNAME@$STG_REMOTE_SERVER_IP:C:/temp/edge_publish_ui.zip
+            - sed "s|IIS_UI_PHYSICAL_PATH_PLACEHOLDER|$STG_IIS_UI_PHYSICAL_PATH|g" windows/scripts/deploy_ui.ps1 > deploy_ui_staging.ps1
+            - scp -o BatchMode=yes deploy_ui_staging.ps1 $STG_REMOTE_USERNAME@$STG_REMOTE_SERVER_IP:C:/temp/deploy_ui.ps1
+            - ssh -o BatchMode=yes $STG_REMOTE_USERNAME@$STG_REMOTE_SERVER_IP "powershell -ExecutionPolicy Bypass -File C:\\temp\\deploy_ui.ps1"
+
+      - step:
+          name: "🚀 Deploy API → Staging"
+          deployment: staging
+          trigger: manual
+          image: mcr.microsoft.com/dotnet/sdk:8.0
+          script:
+            - *setup-ssh
+            - apt-get update -qq && apt-get install -y openssh-client --no-install-recommends
+            - scp -o BatchMode=yes edge_publish_api.zip $STG_REMOTE_USERNAME@$STG_REMOTE_SERVER_IP:C:/temp/edge_publish_api.zip
+            - sed -e "s|IIS_API_PHYSICAL_PATH_PLACEHOLDER|$STG_IIS_API_PHYSICAL_PATH|g" \
+                  -e "s|IIS_APP_POOL_NAME_PLACEHOLDER|$STG_IIS_APP_POOL_NAME|g" \
+                  windows/scripts/deploy_api.ps1 > deploy_api_staging.ps1
+            - scp -o BatchMode=yes deploy_api_staging.ps1 $STG_REMOTE_USERNAME@$STG_REMOTE_SERVER_IP:C:/temp/deploy_api.ps1
+            - ssh -o BatchMode=yes $STG_REMOTE_USERNAME@$STG_REMOTE_SERVER_IP "powershell -ExecutionPolicy Bypass -File C:\\temp\\deploy_api.ps1"
+
+      - step: *dry-run-db
+      - step:
+          <<: *deploy-db
+          name: "🚀 Deploy Database → Staging"
+          deployment: staging
+          trigger: manual
+
+  custom:
+    rollback-ui-production:
+      - step:
+          name: "⏪ Rollback UI (Windows N-1)"
+          deployment: production
+          script:
+            - *setup-ssh
+            - apt-get update -qq && apt-get install -y openssh-client --no-install-recommends
+            - scp -o BatchMode=yes windows/scripts/rollback_ui.ps1 $PROD_REMOTE_USERNAME@$PROD_REMOTE_SERVER_IP:C:/temp/rollback_ui.ps1
+            - ssh -o BatchMode=yes $PROD_REMOTE_USERNAME@$PROD_REMOTE_SERVER_IP "powershell -ExecutionPolicy Bypass -File C:\\temp\\rollback_ui.ps1 -IisUiPath '$PROD_IIS_UI_PHYSICAL_PATH'"
+
+    rollback-api-production:
+      - step:
+          name: "⏪ Rollback API (Windows N-1)"
+          deployment: production
+          image: mcr.microsoft.com/dotnet/sdk:8.0
+          script:
+            - *setup-ssh
+            - apt-get update -qq && apt-get install -y openssh-client --no-install-recommends
+            - scp -o BatchMode=yes windows/scripts/rollback_api.ps1 $PROD_REMOTE_USERNAME@$PROD_REMOTE_SERVER_IP:C:/temp/rollback_api.ps1
+            - ssh -o BatchMode=yes $PROD_REMOTE_USERNAME@$PROD_REMOTE_SERVER_IP "powershell -ExecutionPolicy Bypass -File C:\\temp\\rollback_api.ps1 -IisApiPath '$PROD_IIS_API_PHYSICAL_PATH' -AppPoolName '$PROD_IIS_APP_POOL_NAME'"

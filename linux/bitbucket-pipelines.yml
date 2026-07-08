@@ -1,17 +1,6 @@
 # =============================================================================
-# Bitbucket CI/CD Pipeline — Linux Alternative (Nginx + systemd)
-# Angular UI + .NET 8 API → Ubuntu/Debian on AWS EC2
-# Deploy method: rsync via native SSH key auth
-#
-# Note: Rename this file to `bitbucket-pipelines.yml` if you switch your
-# target infrastructure from Windows Server/IIS to Linux.
-#
-# ─── REQUIRED REPOSITORY VARIABLES ───────────────────────────────────────────
-#   PROD_LINUX_REMOTE_USERNAME - Linux SSH user (e.g. ubuntu, ec2-user)
-#   PROD_LINUX_SERVER_IP       - EC2 public or private IP
-#   PROD_LINUX_UI_PATH         - Nginx web root e.g. /var/www/html/ui
-#   PROD_LINUX_API_PATH        - API directory e.g. /var/www/api
-#   PROD_LINUX_SYSTEMD_SERVICE - Service name e.g. edge-api.service
+# Full Stack CI/CD Pipeline — Linux Alternative (Nginx + systemd)
+# Deploys: Angular UI + .NET 8 API (No Database step implemented for Linux)
 # =============================================================================
 
 options:
@@ -31,7 +20,7 @@ definitions:
 
   steps:
     - step: &build-ui
-        name: "🏗️  Build — Angular UI (Linux)"
+        name: "🏗️  Build — Angular UI"
         caches:
           - node
           - npm-cache
@@ -45,7 +34,7 @@ definitions:
           - edge_publish_ui.zip
 
     - step: &build-api
-        name: "🏗️  Build — .NET 8 API (Linux)"
+        name: "🏗️  Build — .NET 8 API"
         image: mcr.microsoft.com/dotnet/sdk:8.0
         caches:
           - nuget
@@ -75,7 +64,6 @@ pipelines:
             - *setup-ssh
             - apt-get update -qq && apt-get install -y openssh-client rsync --no-install-recommends
 
-            # Backup N-1 state
             - ssh -o BatchMode=yes $PROD_LINUX_REMOTE_USERNAME@$PROD_LINUX_SERVER_IP
                 "mkdir -p /var/backups/edge_ui;
                  ts=\$(date +'%Y%m%d_%H%M%S');
@@ -86,7 +74,7 @@ pipelines:
 
             - scp -o BatchMode=yes edge_publish_ui.zip $PROD_LINUX_REMOTE_USERNAME@$PROD_LINUX_SERVER_IP:/tmp/edge_publish_ui.zip
             
-            - sed "s|LINUX_UI_PATH_PLACEHOLDER|$PROD_LINUX_UI_PATH|g" scripts/linux/deploy_ui.sh > deploy_ui_linux.sh
+            - sed "s|LINUX_UI_PATH_PLACEHOLDER|$PROD_LINUX_UI_PATH|g" linux/scripts/deploy_ui.sh > deploy_ui_linux.sh
             - chmod +x deploy_ui_linux.sh
             - scp -o BatchMode=yes deploy_ui_linux.sh $PROD_LINUX_REMOTE_USERNAME@$PROD_LINUX_SERVER_IP:/tmp/deploy_ui.sh
             
@@ -102,7 +90,6 @@ pipelines:
             - *setup-ssh
             - apt-get update -qq && apt-get install -y openssh-client rsync --no-install-recommends
 
-            # Backup N-1 state
             - ssh -o BatchMode=yes $PROD_LINUX_REMOTE_USERNAME@$PROD_LINUX_SERVER_IP
                 "mkdir -p /var/backups/edge_api;
                  ts=\$(date +'%Y%m%d_%H%M%S');
@@ -115,7 +102,7 @@ pipelines:
             
             - sed -e "s|LINUX_API_PATH_PLACEHOLDER|$PROD_LINUX_API_PATH|g" \
                   -e "s|LINUX_SYSTEMD_SERVICE_PLACEHOLDER|$PROD_LINUX_SYSTEMD_SERVICE|g" \
-                  scripts/linux/deploy_api.sh > deploy_api_linux.sh
+                  linux/scripts/deploy_api.sh > deploy_api_linux.sh
             - chmod +x deploy_api_linux.sh
             - scp -o BatchMode=yes deploy_api_linux.sh $PROD_LINUX_REMOTE_USERNAME@$PROD_LINUX_SERVER_IP:/tmp/deploy_api.sh
             
@@ -129,7 +116,7 @@ pipelines:
           script:
             - *setup-ssh
             - apt-get update -qq && apt-get install -y openssh-client rsync --no-install-recommends
-            - scp -o BatchMode=yes scripts/linux/rollback_ui.sh $PROD_LINUX_REMOTE_USERNAME@$PROD_LINUX_SERVER_IP:/tmp/rollback_ui.sh
+            - scp -o BatchMode=yes linux/scripts/rollback_ui.sh $PROD_LINUX_REMOTE_USERNAME@$PROD_LINUX_SERVER_IP:/tmp/rollback_ui.sh
             - ssh -o BatchMode=yes $PROD_LINUX_REMOTE_USERNAME@$PROD_LINUX_SERVER_IP "bash /tmp/rollback_ui.sh '$PROD_LINUX_UI_PATH'"
 
     rollback-api-linux:
@@ -139,5 +126,5 @@ pipelines:
           script:
             - *setup-ssh
             - apt-get update -qq && apt-get install -y openssh-client rsync --no-install-recommends
-            - scp -o BatchMode=yes scripts/linux/rollback_api.sh $PROD_LINUX_REMOTE_USERNAME@$PROD_LINUX_SERVER_IP:/tmp/rollback_api.sh
+            - scp -o BatchMode=yes linux/scripts/rollback_api.sh $PROD_LINUX_REMOTE_USERNAME@$PROD_LINUX_SERVER_IP:/tmp/rollback_api.sh
             - ssh -o BatchMode=yes $PROD_LINUX_REMOTE_USERNAME@$PROD_LINUX_SERVER_IP "bash /tmp/rollback_api.sh '$PROD_LINUX_API_PATH' '$PROD_LINUX_SYSTEMD_SERVICE'"
