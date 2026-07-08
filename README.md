@@ -96,9 +96,10 @@ If a production smoke test fails, you can instantly recover:
 ## 📁 Repository Structure
 
 ```text
-├── bitbucket-pipelines.yml         # Main CI/CD definition (Windows/IIS)
-├── bitbucket-pipelines-linux.yml   # Alternative CI/CD definition (Linux/Nginx)
-├── bitbucket-pipelines-db.yml      # Multi-tenant DACPAC Database Deployment
+├── bitbucket-pipelines.yml         # Active Main Pipeline (Windows/IIS)
+├── pipelines/                      # Alternative Pipeline Configurations
+│   ├── linux-nginx.yml             # Linux/Nginx Deployment Strategy
+│   └── database-deployment.yml     # Multi-tenant DACPAC DB Strategy
 ├── CHANGELOG.md                    # Semantic versioning history
 ├── SECURITY.md                     # DevSecOps disclosure policies
 ├── docs/
