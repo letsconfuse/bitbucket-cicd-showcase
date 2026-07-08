@@ -1,0 +1,175 @@
+# =============================================================================
+# Database CI/CD Pipeline (Multi-Tenant DACPAC Deployment)
+#
+# Professional Enhancements:
+#   1. Decoupled Build and Deploy steps
+#   2. Drift Detection / Dry Run (--action:Script) before deployment
+#   3. Parallel Execution across multiple databases (using background tasks)
+#   4. Safer Defaults (BlockOnPossibleDataLoss=True)
+#   5. Shared setup steps via YAML anchors
+# =============================================================================
+
+image: mcr.microsoft.com/dotnet/sdk:8.0
+
+options:
+  max-time: 60
+
+definitions:
+  caches:
+    dotnetcore: ~/.nuget/packages
+
+  script-blocks:
+    # Anchor to install required SQL Server tools without repeating code
+    install-sql-tools: &install-sql-tools
+      - set -euo pipefail
+      - apt-get update -qq && apt-get install -y gnupg2 curl --no-install-recommends
+      - curl -sL https://packages.microsoft.com/keys/microsoft.asc | apt-key add -
+      - curl -sL https://packages.microsoft.com/config/debian/11/prod.list > /etc/apt/sources.list.d/mssql-release.list
+      - apt-get update -qq
+      - ACCEPT_EULA=Y apt-get install -y mssql-tools18 --no-install-recommends
+      - dotnet tool install --global Microsoft.SqlPackage
+      - export PATH="$PATH:$HOME/.dotnet/tools:/opt/mssql-tools18/bin"
+
+  steps:
+    # ── Step 1: Build DACPAC ────────────────────────────────────────────────
+    - step: &build-dacpac
+        name: "🏗️ Build Database (DACPAC)"
+        caches:
+          - dotnetcore
+        script:
+          - set -euo pipefail
+          - mkdir -p "dbo/Dependencies"
+          
+          # Fetch Dependency
+          - echo "Fetching dependent DACPAC..."
+          - curl -f -sL -u "${BITBUCKET_USERNAME}:${API_TOKEN}" \
+            "https://api.bitbucket.org/2.0/repositories/adrtaproduct/zentixs_sso_db/downloads/ZENTIXS_SSO_DB.dacpac" \
+            --output "dbo/Dependencies/ZENTIXS_SSO_DB.dacpac"
+          
+          # Build Project
+          - SQLPROJ_PATH="$(find . -maxdepth 1 -name '*.sqlproj' | head -n 1)"
+          - if [ -z "$SQLPROJ_PATH" ]; then echo "ERROR: No .sqlproj file found!" && exit 1; fi
+          - dotnet restore "$SQLPROJ_PATH"
+          - dotnet build "$SQLPROJ_PATH" -c Release
+          
+          # Isolate output artifact
+          - DACPAC_PATH="$(find bin/ -name '*.dacpac' ! -name 'ZENTIXS_SSO_DB.dacpac' | head -n 1)"
+          - if [ -z "$DACPAC_PATH" ]; then echo "ERROR: Compiled .dacpac not found!" && exit 1; fi
+          - cp "$DACPAC_PATH" ./release.dacpac
+        artifacts:
+          - release.dacpac
+
+    # ── Step 2: Dry Run (Generate Scripts) ──────────────────────────────────
+    - step: &dry-run
+        name: "🔍 Drift Detection (Dry-Run)"
+        script:
+          - *install-sql-tools
+          
+          - echo "Fetching target databases..."
+          - DB_LIST=$(sqlcmd -S "${EC2_HOST}" -U "${DB_USER}" -P "${DB_PASSWORD}" -C -Q "SET NOCOUNT ON; SELECT name FROM sys.databases WHERE name LIKE '%sso_docs%' AND state = 0;" -h -1 -W)
+          - if [ -z "$DB_LIST" ]; then echo "WARNING: No databases found." && exit 0; fi
+          
+          - mkdir -p ./sql_scripts
+          
+          # Generate SQL script for each database (No execution)
+          - |
+            for TARGET_DB in $DB_LIST; do
+              echo "Generating script for $TARGET_DB..."
+              sqlpackage --action:Script \
+                --sourcefile:"./release.dacpac" \
+                --targetservername:"${EC2_HOST}" \
+                --targetdatabasename:"$TARGET_DB" \
+                --targetuser:"${DB_USER}" \
+                --targetpassword:"${DB_PASSWORD}" \
+                --outputpath:"./sql_scripts/${TARGET_DB}_migration.sql" \
+                --property:TargetTrustServerCertificate=True \
+                --property:BlockOnPossibleDataLoss=True \
+                --property:IncludeCompositeObjects=False \
+                --property:ExcludeObjectType=Logins \
+                --property:IgnoreAnsiNulls=True \
+                --property:IgnoreComments=True || echo "Warning: Drift detection failed for $TARGET_DB (Possible data loss)"
+            done
+        artifacts:
+          - sql_scripts/**
+
+    # ── Step 3: Publish to Databases (Parallel) ─────────────────────────────
+    - step: &publish-dacpac
+        name: "🚀 Publish DACPAC (Parallel)"
+        script:
+          - *install-sql-tools
+          
+          - DB_LIST=$(sqlcmd -S "${EC2_HOST}" -U "${DB_USER}" -P "${DB_PASSWORD}" -C -Q "SET NOCOUNT ON; SELECT name FROM sys.databases WHERE name LIKE '%sso_docs%' AND state = 0;" -h -1 -W)
+          - if [ -z "$DB_LIST" ]; then echo "WARNING: No databases found." && exit 0; fi
+          
+          - touch /tmp/success.log /tmp/failed.log
+          - pids=""
+          - TOTAL_COUNT=0
+          
+          # Execute deployments in parallel
+          - |
+            for TARGET_DB in $DB_LIST; do
+              TOTAL_COUNT=$((TOTAL_COUNT + 1))
+              echo "Starting deployment for $TARGET_DB..."
+              (
+                if sqlpackage --action:Publish \
+                  --sourcefile:"./release.dacpac" \
+                  --targetservername:"${EC2_HOST}" \
+                  --targetdatabasename:"$TARGET_DB" \
+                  --targetuser:"${DB_USER}" \
+                  --targetpassword:"${DB_PASSWORD}" \
+                  --property:TargetTrustServerCertificate=True \
+                  --property:BlockOnPossibleDataLoss=True \
+                  --property:IncludeCompositeObjects=False \
+                  --property:ExcludeObjectType=Logins \
+                  --property:IgnoreAnsiNulls=True \
+                  --property:IgnoreComments=True \
+                  > "/tmp/log_${TARGET_DB}.txt" 2>&1; then
+                  echo "✅ SUCCESS: $TARGET_DB" >> /tmp/success.log
+                else
+                  echo "❌ ERROR: $TARGET_DB" >> /tmp/failed.log
+                  cat "/tmp/log_${TARGET_DB}.txt" >> /tmp/failed.log
+                fi
+              ) &
+              pids="$pids $!"
+            done
+            wait $pids
+            
+          # Generate Summary Report
+          - |
+            echo "===================================================="
+            echo "               DEPLOYMENT SUMMARY REPORT            "
+            echo "===================================================="
+            SUCCESS_COUNT=$(wc -l < /tmp/success.log)
+            echo "Total Databases Processed: $TOTAL_COUNT"
+            echo "Successful Deployments:    $SUCCESS_COUNT"
+            echo "----------------------------------------------------"
+            
+            if [ -s /tmp/success.log ]; then
+              echo "SUCCESSFUL:"
+              cat /tmp/success.log
+            fi
+            
+            if [ -s /tmp/failed.log ]; then
+              echo "===================================================="
+              echo "FAILED:"
+              cat /tmp/failed.log
+              echo "===================================================="
+              echo "ERROR: One or more database deployments failed."
+              exit 1
+            fi
+            
+            echo "All database deployments completed successfully!"
+
+pipelines:
+  branches:
+    main:
+      - step: *build-dacpac
+      - step:
+          <<: *dry-run
+          name: "🔍 Dry Run (Staging)"
+          deployment: staging
+      - step:
+          <<: *publish-dacpac
+          name: "🚀 Publish to Staging (Manual Approval)"
+          deployment: staging
+          trigger: manual

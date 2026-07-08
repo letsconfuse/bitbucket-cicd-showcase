@@ -98,10 +98,12 @@ If a production smoke test fails, you can instantly recover:
 ```text
 ├── bitbucket-pipelines.yml         # Main CI/CD definition (Windows/IIS)
 ├── bitbucket-pipelines-linux.yml   # Alternative CI/CD definition (Linux/Nginx)
+├── bitbucket-pipelines-db.yml      # Multi-tenant DACPAC Database Deployment
 ├── CHANGELOG.md                    # Semantic versioning history
 ├── SECURITY.md                     # DevSecOps disclosure policies
 ├── docs/
-│   └── runbook.md                  # Operational deployment guides
+│   ├── runbook.md                  # Operational deployment guides
+│   └── db_pipeline_audit.md        # Database deployment architecture breakdown
 ├── scripts/
 │   ├── windows/                    # Windows/IIS (PowerShell) scripts
 │   │   ├── deploy_ui.ps1
