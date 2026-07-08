@@ -19,6 +19,7 @@ A production-grade, DevSecOps-integrated CI/CD pipeline for deploying an **Angul
 *   **Secure Authentication:** Uses Native SSH Key Authentication (no password-based SSH).
 *   **Rich Observability:** Automated Slack notifications for deployment success, failure, and rollback events.
 *   **DRY YAML Architecture:** Heavily utilizes YAML anchors (`&` and `*`) to maintain a clean, reusable pipeline definition.
+*   **Dual OS Support:** Includes configuration for both **Windows/IIS (PowerShell + MSDeploy)** and **Linux/Nginx (Bash + rsync)** infrastructure targets.
 
 ---
 
@@ -95,18 +96,24 @@ If a production smoke test fails, you can instantly recover:
 ## 📁 Repository Structure
 
 ```text
-├── bitbucket-pipelines.yml   # Main CI/CD definition
-├── CHANGELOG.md              # Semantic versioning history
-├── SECURITY.md               # DevSecOps disclosure policies
+├── bitbucket-pipelines.yml         # Main CI/CD definition (Windows/IIS)
+├── bitbucket-pipelines-linux.yml   # Alternative CI/CD definition (Linux/Nginx)
+├── CHANGELOG.md                    # Semantic versioning history
+├── SECURITY.md                     # DevSecOps disclosure policies
 ├── docs/
-│   └── runbook.md            # Operational deployment guides
+│   └── runbook.md                  # Operational deployment guides
 ├── scripts/
-│   ├── deploy_ui.ps1         # MSDeploy script for Angular
-│   ├── deploy_api.ps1        # MSDeploy script for .NET (App Pool management)
-│   ├── rollback_ui.ps1       # N-1 UI restore script
-│   └── rollback_api.ps1      # N-1 API restore script
+│   ├── deploy_ui.ps1               # MSDeploy script for Angular
+│   ├── deploy_api.ps1              # MSDeploy script for .NET
+│   ├── rollback_ui.ps1             # N-1 UI restore script
+│   ├── rollback_api.ps1            # N-1 API restore script
+│   └── linux/                      # Linux equivalent bash scripts
+│       ├── deploy_ui.sh            # rsync UI deployment
+│       ├── deploy_api.sh           # rsync API deployment with systemd restart
+│       ├── rollback_ui.sh          # Linux UI N-1 rollback
+│       └── rollback_api.sh         # Linux API N-1 rollback
 └── tests/
-    └── smoke-test.sh         # Resilient HTTP health checker
+    └── smoke-test.sh               # Resilient HTTP health checker
 ```
 
 ---
