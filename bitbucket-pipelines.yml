@@ -1,0 +1,20 @@
+# =============================================================================
+# Root Pipeline Configuration
+# =============================================================================
+# This repository contains TWO pipeline configurations for different targets:
+#
+#   1. windows/bitbucket-pipelines.yml  → Windows Server / IIS / SQL Server
+#   2. linux/bitbucket-pipelines.yml    → Linux / Nginx / systemd
+#
+# To activate a pipeline:
+#   Copy (or symlink) the desired file to the repository root:
+#     cp windows/bitbucket-pipelines.yml ./bitbucket-pipelines.yml
+#   OR:
+#     cp linux/bitbucket-pipelines.yml ./bitbucket-pipelines.yml
+#
+# By default, this repository ships with the Windows pipeline active.
+# =============================================================================
+
+# NOTE: If you are setting up the pipeline, please copy the contents from 
+# either `windows/bitbucket-pipelines.yml` or `linux/bitbucket-pipelines.yml` 
+# below this header, replacing this note.
