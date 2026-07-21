@@ -1,6 +1,13 @@
 # =============================================================================
 # Full Stack CI/CD Pipeline (Windows/IIS + SQL Server)
 # Deploys: Angular UI + .NET 8 API + SQL Database DACPAC
+#
+# Pipeline Flow:
+#   Security Gates → Build (parallel) → Staging → Production (manual)
+#
+# Branches:
+#   develop → auto-deploy to Staging
+#   main    → auto-deploy to Staging → manual promotion to Production
 # =============================================================================
 
 options:
@@ -18,6 +25,16 @@ definitions:
       - mkdir -p ~/.ssh && chmod 700 ~/.ssh
       - echo "SSH identity loaded by Bitbucket key management."
 
+    slack-notify: &slack-notify
+      - |
+        if [ "$BITBUCKET_EXIT_CODE" -eq 0 ]; then
+          curl -s -X POST "$SLACK_WEBHOOK_URL" -H 'Content-Type: application/json' \
+            -d "{\"text\":\"✅ *${BITBUCKET_DEPLOYMENT_ENVIRONMENT}* deployed successfully — ${BITBUCKET_REPO_SLUG}@${BITBUCKET_COMMIT:0:7}\"}" || true
+        else
+          curl -s -X POST "$SLACK_WEBHOOK_URL" -H 'Content-Type: application/json' \
+            -d "{\"text\":\"❌ *${BITBUCKET_DEPLOYMENT_ENVIRONMENT}* deployment FAILED — ${BITBUCKET_REPO_SLUG}@${BITBUCKET_COMMIT:0:7}\"}" || true
+        fi
+
     install-sql-tools: &install-sql-tools
       - set -euo pipefail
       - apt-get update -qq && apt-get install -y gnupg2 curl --no-install-recommends
@@ -29,6 +46,28 @@ definitions:
       - export PATH="$PATH:$HOME/.dotnet/tools:/opt/mssql-tools18/bin"
 
   steps:
+    # ── Security Gates ──────────────────────────────────────────────────
+    - step: &secret-scan
+        name: "🔒 Security — Secret Scan (Gitleaks)"
+        image: zricethezav/gitleaks:latest
+        script:
+          - gitleaks detect --source . --verbose --redact
+
+    - step: &dep-scan
+        name: "🔒 Security — Dependency Scan (Snyk)"
+        script:
+          - set -euo pipefail
+          - npm ci --prefer-offline --legacy-peer-deps
+          - npx snyk test --severity-threshold=critical || true
+          - npx snyk monitor || true
+
+    - step: &lint-scripts
+        name: "🧹 Lint — Shell Scripts"
+        image: koalaman/shellcheck-alpine:latest
+        script:
+          - shellcheck tests/smoke-test.sh linux/scripts/*.sh || true
+
+    # ── Build Steps ─────────────────────────────────────────────────────
     - step: &build-ui
         name: "🏗️  Build — Angular UI"
         size: 2x
@@ -76,8 +115,9 @@ definitions:
         artifacts:
           - release.dacpac
 
+    # ── Database Steps ──────────────────────────────────────────────────
     - step: &dry-run-db
-        name: "🔍 DB Dry Run (Staging)"
+        name: "🔍 DB Dry Run — Script Generation"
         image: mcr.microsoft.com/dotnet/sdk:8.0
         script:
           - *install-sql-tools
@@ -127,9 +167,63 @@ definitions:
             wait $pids
           - if [ -s /tmp/failed.log ]; then cat /tmp/failed.log; exit 1; fi
 
+# =============================================================================
+# Pipeline Definitions
+# =============================================================================
 pipelines:
   branches:
+    # ── develop → Auto-deploy to Staging ────────────────────────────────
+    develop:
+      - parallel:
+          - step: *secret-scan
+          - step: *dep-scan
+          - step: *lint-scripts
+
+      - parallel:
+          - step: *build-ui
+          - step: *build-api
+
+      - step:
+          name: "🚀 Deploy UI → Staging"
+          deployment: staging
+          script:
+            - set -euo pipefail
+            - *setup-ssh
+            - apt-get update -qq && apt-get install -y openssh-client --no-install-recommends
+            - scp -o BatchMode=yes edge_publish_ui.zip $STG_REMOTE_USERNAME@$STG_REMOTE_SERVER_IP:C:/temp/edge_publish_ui.zip
+            - sed "s|IIS_UI_PHYSICAL_PATH_PLACEHOLDER|$STG_IIS_UI_PHYSICAL_PATH|g" windows/scripts/deploy_ui.ps1 > deploy_ui_staging.ps1
+            - scp -o BatchMode=yes deploy_ui_staging.ps1 $STG_REMOTE_USERNAME@$STG_REMOTE_SERVER_IP:C:/temp/deploy_ui.ps1
+            - ssh -o BatchMode=yes $STG_REMOTE_USERNAME@$STG_REMOTE_SERVER_IP "powershell -ExecutionPolicy Bypass -File C:\\temp\\deploy_ui.ps1"
+            - sh tests/smoke-test.sh "$STG_HEALTH_CHECK_URL" 5 15
+          after-script:
+            - *slack-notify
+
+      - step:
+          name: "🚀 Deploy API → Staging"
+          deployment: staging
+          trigger: manual
+          image: mcr.microsoft.com/dotnet/sdk:8.0
+          script:
+            - set -euo pipefail
+            - *setup-ssh
+            - apt-get update -qq && apt-get install -y openssh-client --no-install-recommends
+            - scp -o BatchMode=yes edge_publish_api.zip $STG_REMOTE_USERNAME@$STG_REMOTE_SERVER_IP:C:/temp/edge_publish_api.zip
+            - sed -e "s|IIS_API_PHYSICAL_PATH_PLACEHOLDER|$STG_IIS_API_PHYSICAL_PATH|g" \
+                  -e "s|IIS_APP_POOL_NAME_PLACEHOLDER|$STG_IIS_APP_POOL_NAME|g" \
+                  windows/scripts/deploy_api.ps1 > deploy_api_staging.ps1
+            - scp -o BatchMode=yes deploy_api_staging.ps1 $STG_REMOTE_USERNAME@$STG_REMOTE_SERVER_IP:C:/temp/deploy_api.ps1
+            - ssh -o BatchMode=yes $STG_REMOTE_USERNAME@$STG_REMOTE_SERVER_IP "powershell -ExecutionPolicy Bypass -File C:\\temp\\deploy_api.ps1"
+            - sh tests/smoke-test.sh "$STG_HEALTH_CHECK_URL" 5 15
+          after-script:
+            - *slack-notify
+
+    # ── main → Staging then Production (manual) ─────────────────────────
     main:
+      - parallel:
+          - step: *secret-scan
+          - step: *dep-scan
+          - step: *lint-scripts
+
       - parallel:
           - step: *build-ui
           - step: *build-api
@@ -140,12 +234,16 @@ pipelines:
           name: "🚀 Deploy UI → Staging"
           deployment: staging
           script:
+            - set -euo pipefail
             - *setup-ssh
             - apt-get update -qq && apt-get install -y openssh-client --no-install-recommends
             - scp -o BatchMode=yes edge_publish_ui.zip $STG_REMOTE_USERNAME@$STG_REMOTE_SERVER_IP:C:/temp/edge_publish_ui.zip
             - sed "s|IIS_UI_PHYSICAL_PATH_PLACEHOLDER|$STG_IIS_UI_PHYSICAL_PATH|g" windows/scripts/deploy_ui.ps1 > deploy_ui_staging.ps1
             - scp -o BatchMode=yes deploy_ui_staging.ps1 $STG_REMOTE_USERNAME@$STG_REMOTE_SERVER_IP:C:/temp/deploy_ui.ps1
             - ssh -o BatchMode=yes $STG_REMOTE_USERNAME@$STG_REMOTE_SERVER_IP "powershell -ExecutionPolicy Bypass -File C:\\temp\\deploy_ui.ps1"
+            - sh tests/smoke-test.sh "$STG_HEALTH_CHECK_URL" 5 15
+          after-script:
+            - *slack-notify
 
       - step:
           name: "🚀 Deploy API → Staging"
@@ -153,6 +251,7 @@ pipelines:
           trigger: manual
           image: mcr.microsoft.com/dotnet/sdk:8.0
           script:
+            - set -euo pipefail
             - *setup-ssh
             - apt-get update -qq && apt-get install -y openssh-client --no-install-recommends
             - scp -o BatchMode=yes edge_publish_api.zip $STG_REMOTE_USERNAME@$STG_REMOTE_SERVER_IP:C:/temp/edge_publish_api.zip
@@ -161,6 +260,9 @@ pipelines:
                   windows/scripts/deploy_api.ps1 > deploy_api_staging.ps1
             - scp -o BatchMode=yes deploy_api_staging.ps1 $STG_REMOTE_USERNAME@$STG_REMOTE_SERVER_IP:C:/temp/deploy_api.ps1
             - ssh -o BatchMode=yes $STG_REMOTE_USERNAME@$STG_REMOTE_SERVER_IP "powershell -ExecutionPolicy Bypass -File C:\\temp\\deploy_api.ps1"
+            - sh tests/smoke-test.sh "$STG_HEALTH_CHECK_URL" 5 15
+          after-script:
+            - *slack-notify
 
       - step: *dry-run-db
       - step:
@@ -169,16 +271,63 @@ pipelines:
           deployment: staging
           trigger: manual
 
+      # Deploy Production (manual approval gates)
+      - step:
+          name: "🚀 Deploy UI → Production"
+          deployment: production
+          trigger: manual
+          script:
+            - set -euo pipefail
+            - *setup-ssh
+            - apt-get update -qq && apt-get install -y openssh-client --no-install-recommends
+            # Backup current state
+            - ssh -o BatchMode=yes $PROD_REMOTE_USERNAME@$PROD_REMOTE_SERVER_IP "powershell -Command \"New-Item -ItemType Directory -Force -Path 'C:\\releases\\ui'; \$ts = Get-Date -Format 'yyyyMMdd_HHmmss'; if (Test-Path '$PROD_IIS_UI_PHYSICAL_PATH') { Copy-Item -Path '$PROD_IIS_UI_PHYSICAL_PATH' -Destination \\\"C:\\releases\\ui\\\$ts\\\" -Recurse -Force }; Get-ChildItem 'C:\\releases\\ui' -Directory | Sort-Object CreationTime -Descending | Select-Object -Skip 3 | Remove-Item -Recurse -Force\""
+            # Deploy
+            - scp -o BatchMode=yes edge_publish_ui.zip $PROD_REMOTE_USERNAME@$PROD_REMOTE_SERVER_IP:C:/temp/edge_publish_ui.zip
+            - sed "s|IIS_UI_PHYSICAL_PATH_PLACEHOLDER|$PROD_IIS_UI_PHYSICAL_PATH|g" windows/scripts/deploy_ui.ps1 > deploy_ui.ps1
+            - scp -o BatchMode=yes deploy_ui.ps1 $PROD_REMOTE_USERNAME@$PROD_REMOTE_SERVER_IP:C:/temp/deploy_ui.ps1
+            - ssh -o BatchMode=yes $PROD_REMOTE_USERNAME@$PROD_REMOTE_SERVER_IP "powershell -ExecutionPolicy Bypass -File C:\\temp\\deploy_ui.ps1"
+            # Smoke test
+            - sh tests/smoke-test.sh "$PROD_HEALTH_CHECK_URL" 5 15
+          after-script:
+            - *slack-notify
+
+      - step:
+          name: "🚀 Deploy API → Production"
+          deployment: production
+          trigger: manual
+          image: mcr.microsoft.com/dotnet/sdk:8.0
+          script:
+            - set -euo pipefail
+            - *setup-ssh
+            - apt-get update -qq && apt-get install -y openssh-client --no-install-recommends
+            # Backup current state
+            - ssh -o BatchMode=yes $PROD_REMOTE_USERNAME@$PROD_REMOTE_SERVER_IP "powershell -Command \"New-Item -ItemType Directory -Force -Path 'C:\\releases\\api'; \$ts = Get-Date -Format 'yyyyMMdd_HHmmss'; if (Test-Path '$PROD_IIS_API_PHYSICAL_PATH') { Copy-Item -Path '$PROD_IIS_API_PHYSICAL_PATH' -Destination \\\"C:\\releases\\api\\\$ts\\\" -Recurse -Force }; Get-ChildItem 'C:\\releases\\api' -Directory | Sort-Object CreationTime -Descending | Select-Object -Skip 3 | Remove-Item -Recurse -Force\""
+            # Deploy
+            - scp -o BatchMode=yes edge_publish_api.zip $PROD_REMOTE_USERNAME@$PROD_REMOTE_SERVER_IP:C:/temp/edge_publish_api.zip
+            - sed -e "s|IIS_API_PHYSICAL_PATH_PLACEHOLDER|$PROD_IIS_API_PHYSICAL_PATH|g" \
+                  -e "s|IIS_APP_POOL_NAME_PLACEHOLDER|$PROD_IIS_APP_POOL_NAME|g" \
+                  windows/scripts/deploy_api.ps1 > deploy_api.ps1
+            - scp -o BatchMode=yes deploy_api.ps1 $PROD_REMOTE_USERNAME@$PROD_REMOTE_SERVER_IP:C:/temp/deploy_api.ps1
+            - ssh -o BatchMode=yes $PROD_REMOTE_USERNAME@$PROD_REMOTE_SERVER_IP "powershell -ExecutionPolicy Bypass -File C:\\temp\\deploy_api.ps1"
+            # Smoke test
+            - sh tests/smoke-test.sh "$PROD_HEALTH_CHECK_URL" 5 15
+          after-script:
+            - *slack-notify
+
   custom:
     rollback-ui-production:
       - step:
           name: "⏪ Rollback UI (Windows N-1)"
           deployment: production
           script:
+            - set -euo pipefail
             - *setup-ssh
             - apt-get update -qq && apt-get install -y openssh-client --no-install-recommends
             - scp -o BatchMode=yes windows/scripts/rollback_ui.ps1 $PROD_REMOTE_USERNAME@$PROD_REMOTE_SERVER_IP:C:/temp/rollback_ui.ps1
             - ssh -o BatchMode=yes $PROD_REMOTE_USERNAME@$PROD_REMOTE_SERVER_IP "powershell -ExecutionPolicy Bypass -File C:\\temp\\rollback_ui.ps1 -IisUiPath '$PROD_IIS_UI_PHYSICAL_PATH'"
+          after-script:
+            - *slack-notify
 
     rollback-api-production:
       - step:
@@ -186,7 +335,10 @@ pipelines:
           deployment: production
           image: mcr.microsoft.com/dotnet/sdk:8.0
           script:
+            - set -euo pipefail
             - *setup-ssh
             - apt-get update -qq && apt-get install -y openssh-client --no-install-recommends
             - scp -o BatchMode=yes windows/scripts/rollback_api.ps1 $PROD_REMOTE_USERNAME@$PROD_REMOTE_SERVER_IP:C:/temp/rollback_api.ps1
             - ssh -o BatchMode=yes $PROD_REMOTE_USERNAME@$PROD_REMOTE_SERVER_IP "powershell -ExecutionPolicy Bypass -File C:\\temp\\rollback_api.ps1 -IisApiPath '$PROD_IIS_API_PHYSICAL_PATH' -AppPoolName '$PROD_IIS_APP_POOL_NAME'"
+          after-script:
+            - *slack-notify

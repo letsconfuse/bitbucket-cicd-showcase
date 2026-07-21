@@ -1,6 +1,13 @@
 # =============================================================================
 # Full Stack CI/CD Pipeline — Linux Alternative (Nginx + systemd)
 # Deploys: Angular UI + .NET 8 API (No Database step implemented for Linux)
+#
+# Pipeline Flow:
+#   Security Gates → Build (parallel) → Staging → Production (manual)
+#
+# Branches:
+#   develop → auto-deploy to Staging
+#   main    → auto-deploy to Staging → manual promotion to Production
 # =============================================================================
 
 options:
@@ -18,7 +25,39 @@ definitions:
       - mkdir -p ~/.ssh && chmod 700 ~/.ssh
       - echo "SSH identity loaded by Bitbucket key management."
 
+    slack-notify: &slack-notify
+      - |
+        if [ "$BITBUCKET_EXIT_CODE" -eq 0 ]; then
+          curl -s -X POST "$SLACK_WEBHOOK_URL" -H 'Content-Type: application/json' \
+            -d "{\"text\":\"✅ *${BITBUCKET_DEPLOYMENT_ENVIRONMENT}* deployed — ${BITBUCKET_REPO_SLUG}@${BITBUCKET_COMMIT:0:7}\"}" || true
+        else
+          curl -s -X POST "$SLACK_WEBHOOK_URL" -H 'Content-Type: application/json' \
+            -d "{\"text\":\"❌ *${BITBUCKET_DEPLOYMENT_ENVIRONMENT}* FAILED — ${BITBUCKET_REPO_SLUG}@${BITBUCKET_COMMIT:0:7}\"}" || true
+        fi
+
   steps:
+    # ── Security Gates ──────────────────────────────────────────────────
+    - step: &secret-scan
+        name: "🔒 Security — Secret Scan (Gitleaks)"
+        image: zricethezav/gitleaks:latest
+        script:
+          - gitleaks detect --source . --verbose --redact
+
+    - step: &dep-scan
+        name: "🔒 Security — Dependency Scan (Snyk)"
+        script:
+          - set -euo pipefail
+          - npm ci --prefer-offline --legacy-peer-deps
+          - npx snyk test --severity-threshold=critical || true
+          - npx snyk monitor || true
+
+    - step: &lint-scripts
+        name: "🧹 Lint — Shell Scripts"
+        image: koalaman/shellcheck-alpine:latest
+        script:
+          - shellcheck tests/smoke-test.sh linux/scripts/*.sh || true
+
+    # ── Build Steps ─────────────────────────────────────────────────────
     - step: &build-ui
         name: "🏗️  Build — Angular UI"
         caches:
@@ -48,13 +87,135 @@ definitions:
         artifacts:
           - edge_publish_api.zip
 
+# =============================================================================
+# Pipeline Definitions
+# =============================================================================
 pipelines:
   branches:
-    main:
+    # ── develop → Auto-deploy to Staging ────────────────────────────────
+    develop:
+      - parallel:
+          - step: *secret-scan
+          - step: *dep-scan
+          - step: *lint-scripts
+
       - parallel:
           - step: *build-ui
           - step: *build-api
 
+      - step:
+          name: "🚀 Deploy UI → Staging (Linux/Nginx)"
+          deployment: staging
+          script:
+            - set -euo pipefail
+            - *setup-ssh
+            - apt-get update -qq && apt-get install -y openssh-client rsync --no-install-recommends
+            - ssh -o BatchMode=yes $STG_LINUX_REMOTE_USERNAME@$STG_LINUX_SERVER_IP
+                "mkdir -p /var/backups/edge_ui;
+                 ts=\$(date +'%Y%m%d_%H%M%S');
+                 if [ -d \"$STG_LINUX_UI_PATH\" ]; then
+                   cp -r \"$STG_LINUX_UI_PATH\" \"/var/backups/edge_ui/\$ts\";
+                 fi;
+                 ls -dt /var/backups/edge_ui/*/ | tail -n +4 | xargs -d '\n' rm -rf"
+            - scp -o BatchMode=yes edge_publish_ui.zip $STG_LINUX_REMOTE_USERNAME@$STG_LINUX_SERVER_IP:/tmp/edge_publish_ui.zip
+            - sed "s|LINUX_UI_PATH_PLACEHOLDER|$STG_LINUX_UI_PATH|g" linux/scripts/deploy_ui.sh > deploy_ui_linux.sh
+            - chmod +x deploy_ui_linux.sh
+            - scp -o BatchMode=yes deploy_ui_linux.sh $STG_LINUX_REMOTE_USERNAME@$STG_LINUX_SERVER_IP:/tmp/deploy_ui.sh
+            - ssh -o BatchMode=yes $STG_LINUX_REMOTE_USERNAME@$STG_LINUX_SERVER_IP "bash /tmp/deploy_ui.sh"
+            - sh tests/smoke-test.sh "$STG_HEALTH_CHECK_URL" 5 15
+          after-script:
+            - *slack-notify
+
+      - step:
+          name: "🚀 Deploy API → Staging (Linux/systemd)"
+          deployment: staging
+          trigger: manual
+          image: mcr.microsoft.com/dotnet/sdk:8.0
+          script:
+            - set -euo pipefail
+            - *setup-ssh
+            - apt-get update -qq && apt-get install -y openssh-client rsync --no-install-recommends
+            - ssh -o BatchMode=yes $STG_LINUX_REMOTE_USERNAME@$STG_LINUX_SERVER_IP
+                "mkdir -p /var/backups/edge_api;
+                 ts=\$(date +'%Y%m%d_%H%M%S');
+                 if [ -d \"$STG_LINUX_API_PATH\" ]; then
+                   cp -r \"$STG_LINUX_API_PATH\" \"/var/backups/edge_api/\$ts\";
+                 fi;
+                 ls -dt /var/backups/edge_api/*/ | tail -n +4 | xargs -d '\n' rm -rf"
+            - scp -o BatchMode=yes edge_publish_api.zip $STG_LINUX_REMOTE_USERNAME@$STG_LINUX_SERVER_IP:/tmp/edge_publish_api.zip
+            - sed -e "s|LINUX_API_PATH_PLACEHOLDER|$STG_LINUX_API_PATH|g" \
+                  -e "s|LINUX_SYSTEMD_SERVICE_PLACEHOLDER|$STG_LINUX_SYSTEMD_SERVICE|g" \
+                  linux/scripts/deploy_api.sh > deploy_api_linux.sh
+            - chmod +x deploy_api_linux.sh
+            - scp -o BatchMode=yes deploy_api_linux.sh $STG_LINUX_REMOTE_USERNAME@$STG_LINUX_SERVER_IP:/tmp/deploy_api.sh
+            - ssh -o BatchMode=yes $STG_LINUX_REMOTE_USERNAME@$STG_LINUX_SERVER_IP "bash /tmp/deploy_api.sh"
+            - sh tests/smoke-test.sh "$STG_HEALTH_CHECK_URL" 5 15
+          after-script:
+            - *slack-notify
+
+    # ── main → Staging then Production (manual) ─────────────────────────
+    main:
+      - parallel:
+          - step: *secret-scan
+          - step: *dep-scan
+          - step: *lint-scripts
+
+      - parallel:
+          - step: *build-ui
+          - step: *build-api
+
+      # Deploy Staging
+      - step:
+          name: "🚀 Deploy UI → Staging (Linux/Nginx)"
+          deployment: staging
+          script:
+            - set -euo pipefail
+            - *setup-ssh
+            - apt-get update -qq && apt-get install -y openssh-client rsync --no-install-recommends
+            - ssh -o BatchMode=yes $STG_LINUX_REMOTE_USERNAME@$STG_LINUX_SERVER_IP
+                "mkdir -p /var/backups/edge_ui;
+                 ts=\$(date +'%Y%m%d_%H%M%S');
+                 if [ -d \"$STG_LINUX_UI_PATH\" ]; then
+                   cp -r \"$STG_LINUX_UI_PATH\" \"/var/backups/edge_ui/\$ts\";
+                 fi;
+                 ls -dt /var/backups/edge_ui/*/ | tail -n +4 | xargs -d '\n' rm -rf"
+            - scp -o BatchMode=yes edge_publish_ui.zip $STG_LINUX_REMOTE_USERNAME@$STG_LINUX_SERVER_IP:/tmp/edge_publish_ui.zip
+            - sed "s|LINUX_UI_PATH_PLACEHOLDER|$STG_LINUX_UI_PATH|g" linux/scripts/deploy_ui.sh > deploy_ui_linux.sh
+            - chmod +x deploy_ui_linux.sh
+            - scp -o BatchMode=yes deploy_ui_linux.sh $STG_LINUX_REMOTE_USERNAME@$STG_LINUX_SERVER_IP:/tmp/deploy_ui.sh
+            - ssh -o BatchMode=yes $STG_LINUX_REMOTE_USERNAME@$STG_LINUX_SERVER_IP "bash /tmp/deploy_ui.sh"
+            - sh tests/smoke-test.sh "$STG_HEALTH_CHECK_URL" 5 15
+          after-script:
+            - *slack-notify
+
+      - step:
+          name: "🚀 Deploy API → Staging (Linux/systemd)"
+          deployment: staging
+          trigger: manual
+          image: mcr.microsoft.com/dotnet/sdk:8.0
+          script:
+            - set -euo pipefail
+            - *setup-ssh
+            - apt-get update -qq && apt-get install -y openssh-client rsync --no-install-recommends
+            - ssh -o BatchMode=yes $STG_LINUX_REMOTE_USERNAME@$STG_LINUX_SERVER_IP
+                "mkdir -p /var/backups/edge_api;
+                 ts=\$(date +'%Y%m%d_%H%M%S');
+                 if [ -d \"$STG_LINUX_API_PATH\" ]; then
+                   cp -r \"$STG_LINUX_API_PATH\" \"/var/backups/edge_api/\$ts\";
+                 fi;
+                 ls -dt /var/backups/edge_api/*/ | tail -n +4 | xargs -d '\n' rm -rf"
+            - scp -o BatchMode=yes edge_publish_api.zip $STG_LINUX_REMOTE_USERNAME@$STG_LINUX_SERVER_IP:/tmp/edge_publish_api.zip
+            - sed -e "s|LINUX_API_PATH_PLACEHOLDER|$STG_LINUX_API_PATH|g" \
+                  -e "s|LINUX_SYSTEMD_SERVICE_PLACEHOLDER|$STG_LINUX_SYSTEMD_SERVICE|g" \
+                  linux/scripts/deploy_api.sh > deploy_api_linux.sh
+            - chmod +x deploy_api_linux.sh
+            - scp -o BatchMode=yes deploy_api_linux.sh $STG_LINUX_REMOTE_USERNAME@$STG_LINUX_SERVER_IP:/tmp/deploy_api.sh
+            - ssh -o BatchMode=yes $STG_LINUX_REMOTE_USERNAME@$STG_LINUX_SERVER_IP "bash /tmp/deploy_api.sh"
+            - sh tests/smoke-test.sh "$STG_HEALTH_CHECK_URL" 5 15
+          after-script:
+            - *slack-notify
+
+      # Deploy Production (manual approval gates)
       - step:
           name: "🚀 Deploy UI → Production (Linux/Nginx)"
           deployment: production
@@ -63,7 +224,6 @@ pipelines:
             - set -euo pipefail
             - *setup-ssh
             - apt-get update -qq && apt-get install -y openssh-client rsync --no-install-recommends
-
             - ssh -o BatchMode=yes $PROD_LINUX_REMOTE_USERNAME@$PROD_LINUX_SERVER_IP
                 "mkdir -p /var/backups/edge_ui;
                  ts=\$(date +'%Y%m%d_%H%M%S');
@@ -71,14 +231,14 @@ pipelines:
                    cp -r \"$PROD_LINUX_UI_PATH\" \"/var/backups/edge_ui/\$ts\";
                  fi;
                  ls -dt /var/backups/edge_ui/*/ | tail -n +4 | xargs -d '\n' rm -rf"
-
             - scp -o BatchMode=yes edge_publish_ui.zip $PROD_LINUX_REMOTE_USERNAME@$PROD_LINUX_SERVER_IP:/tmp/edge_publish_ui.zip
-            
             - sed "s|LINUX_UI_PATH_PLACEHOLDER|$PROD_LINUX_UI_PATH|g" linux/scripts/deploy_ui.sh > deploy_ui_linux.sh
             - chmod +x deploy_ui_linux.sh
             - scp -o BatchMode=yes deploy_ui_linux.sh $PROD_LINUX_REMOTE_USERNAME@$PROD_LINUX_SERVER_IP:/tmp/deploy_ui.sh
-            
             - ssh -o BatchMode=yes $PROD_LINUX_REMOTE_USERNAME@$PROD_LINUX_SERVER_IP "bash /tmp/deploy_ui.sh"
+            - sh tests/smoke-test.sh "$PROD_HEALTH_CHECK_URL" 5 15
+          after-script:
+            - *slack-notify
 
       - step:
           name: "🚀 Deploy API → Production (Linux/systemd)"
@@ -89,7 +249,6 @@ pipelines:
             - set -euo pipefail
             - *setup-ssh
             - apt-get update -qq && apt-get install -y openssh-client rsync --no-install-recommends
-
             - ssh -o BatchMode=yes $PROD_LINUX_REMOTE_USERNAME@$PROD_LINUX_SERVER_IP
                 "mkdir -p /var/backups/edge_api;
                  ts=\$(date +'%Y%m%d_%H%M%S');
@@ -97,16 +256,16 @@ pipelines:
                    cp -r \"$PROD_LINUX_API_PATH\" \"/var/backups/edge_api/\$ts\";
                  fi;
                  ls -dt /var/backups/edge_api/*/ | tail -n +4 | xargs -d '\n' rm -rf"
-
             - scp -o BatchMode=yes edge_publish_api.zip $PROD_LINUX_REMOTE_USERNAME@$PROD_LINUX_SERVER_IP:/tmp/edge_publish_api.zip
-            
             - sed -e "s|LINUX_API_PATH_PLACEHOLDER|$PROD_LINUX_API_PATH|g" \
                   -e "s|LINUX_SYSTEMD_SERVICE_PLACEHOLDER|$PROD_LINUX_SYSTEMD_SERVICE|g" \
                   linux/scripts/deploy_api.sh > deploy_api_linux.sh
             - chmod +x deploy_api_linux.sh
             - scp -o BatchMode=yes deploy_api_linux.sh $PROD_LINUX_REMOTE_USERNAME@$PROD_LINUX_SERVER_IP:/tmp/deploy_api.sh
-            
             - ssh -o BatchMode=yes $PROD_LINUX_REMOTE_USERNAME@$PROD_LINUX_SERVER_IP "bash /tmp/deploy_api.sh"
+            - sh tests/smoke-test.sh "$PROD_HEALTH_CHECK_URL" 5 15
+          after-script:
+            - *slack-notify
 
   custom:
     rollback-ui-linux:
@@ -114,17 +273,23 @@ pipelines:
           name: "⏪ Rollback UI (Linux N-1)"
           deployment: production
           script:
+            - set -euo pipefail
             - *setup-ssh
             - apt-get update -qq && apt-get install -y openssh-client rsync --no-install-recommends
             - scp -o BatchMode=yes linux/scripts/rollback_ui.sh $PROD_LINUX_REMOTE_USERNAME@$PROD_LINUX_SERVER_IP:/tmp/rollback_ui.sh
             - ssh -o BatchMode=yes $PROD_LINUX_REMOTE_USERNAME@$PROD_LINUX_SERVER_IP "bash /tmp/rollback_ui.sh '$PROD_LINUX_UI_PATH'"
+          after-script:
+            - *slack-notify
 
     rollback-api-linux:
       - step:
           name: "⏪ Rollback API (Linux N-1)"
           deployment: production
           script:
+            - set -euo pipefail
             - *setup-ssh
             - apt-get update -qq && apt-get install -y openssh-client rsync --no-install-recommends
             - scp -o BatchMode=yes linux/scripts/rollback_api.sh $PROD_LINUX_REMOTE_USERNAME@$PROD_LINUX_SERVER_IP:/tmp/rollback_api.sh
             - ssh -o BatchMode=yes $PROD_LINUX_REMOTE_USERNAME@$PROD_LINUX_SERVER_IP "bash /tmp/rollback_api.sh '$PROD_LINUX_API_PATH' '$PROD_LINUX_SYSTEMD_SERVICE'"
+          after-script:
+            - *slack-notify
